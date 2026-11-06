@@ -30,9 +30,18 @@ def match_features(descriptors1, descriptors2, matcher):
     return good_matches
 
 
+def valid_corners(corners, frame_shape):
+    height, width = frame_shape[:2]
+    return (
+        np.isfinite(corners).all()
+        and cv2.isContourConvex(corners)
+        and cv2.contourArea(corners) >= 0.001 * width * height
+    )
+
+
 def find_object(reference_keypoints, keypoints, matches, reference_shape):
     if len(matches) < 4:
-        return None, 0
+        return None, None, 0
 
     src = np.float32([reference_keypoints[m.queryIdx].pt for m in matches])
     dst = np.float32([keypoints[m.trainIdx].pt for m in matches])
@@ -40,7 +49,7 @@ def find_object(reference_keypoints, keypoints, matches, reference_shape):
 
     inliers = int(mask.sum()) if mask is not None else 0
     if matrix is None or inliers < 8:
-        return None, inliers
+        return None, None, inliers
 
     height, width = reference_shape[:2]
     corners = np.float32([
@@ -50,14 +59,61 @@ def find_object(reference_keypoints, keypoints, matches, reference_shape):
         [0, height - 1],
     ]).reshape(-1, 1, 2)
     transformed = cv2.perspectiveTransform(corners, matrix)
-    return np.int32(transformed), inliers
+    if not valid_corners(transformed, reference_shape):
+        return None, None, inliers
+
+    # Inliers match points inside the full reference image of the object.
+    points = np.unique(dst[mask.ravel() == 1], axis=0).reshape(-1, 1, 2)
+    return transformed, points, inliers
+
+
+def track_points(previous_gray, gray, points, corners):
+    if points is None or len(points) < 8:
+        return None, None, 0
+
+    next_points, status, _ = cv2.calcOpticalFlowPyrLK(
+        previous_gray, gray, points, None, winSize=(21, 21), maxLevel=3
+    )
+    if next_points is None:
+        return None, None, 0
+    back_points, back_status, _ = cv2.calcOpticalFlowPyrLK(
+        gray, previous_gray, next_points, None, winSize=(21, 21), maxLevel=3
+    )
+    if back_points is None:
+        return None, None, 0
+
+    # Use the same mask for old and new points to preserve correspondences.
+    error = np.linalg.norm(back_points - points, axis=2).ravel()
+    good = (status.ravel() == 1) & (back_status.ravel() == 1) & (error < 1.0)
+    src, dst = points[good], next_points[good]
+    if len(src) < 8:
+        return None, None, 0
+
+    matrix, mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
+    inliers = int(mask.sum()) if mask is not None else 0
+    if matrix is None or inliers < 8:
+        return None, None, inliers
+    transformed = cv2.perspectiveTransform(corners, matrix)
+    if not valid_corners(transformed, gray.shape):
+        return None, None, inliers
+
+    return transformed, dst[mask.ravel() == 1], inliers
+
+
+def draw_object(frame, corners):
+    corners = np.int32(corners)
+    cv2.polylines(frame, [corners], True, (0, 255, 0), 2)
+    x, y = corners[0, 0]
+    cv2.putText(frame, "Mona Lisa", (int(x), max(20, int(y) - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Track a planar object using sift and RANSAC."
+        description="Locate Mona Lisa using SIFT or SIFT with Lucas-Kanade tracking."
     )
     parser.add_argument("input", type=Path, help="path to the input video")
+    parser.add_argument("--method", choices=("sift", "hybrid"), default="sift")
     args = parser.parse_args()
 
     capture = cv2.VideoCapture(str(args.input))
@@ -67,13 +123,11 @@ def main():
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = capture.get(cv2.CAP_PROP_FPS)
-    print(f"Input: {args.input}")
-    print(f"Dimensions: {width} x {height}")
-    print(f"FPS: {fps:.6g}")
 
     output = Path("results")
     output.mkdir(exist_ok=True)
-    output_path = output / f"{args.input.stem}.avi"
+    output_stem = f"{args.input.stem}_{args.method}"
+    output_path = output / f"{output_stem}.avi"
     writer = cv2.VideoWriter(
         str(output_path), cv2.VideoWriter_fourcc(*"MJPG"), fps, (width, height)
     )
@@ -82,52 +136,35 @@ def main():
     matcher = cv2.BFMatcher(cv2.NORM_L2)
     frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
     example_frames = {max(2, frame_count * part // 4) for part in (1, 2, 3)}
-
     processed = 0
+    points, corners = None, None
+
     while True:
         success, frame = capture.read()
         if not success:
             break
-
-        keypoints, descriptors = detect_features(frame, sift)
-        good_matches = []
-        corners, inliers = None, 0
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         if processed == 0:
             reference = frame.copy()
-            reference_keypoints = keypoints
-            reference_descriptors = descriptors
-            print(f"Reference keypoints: {len(reference_keypoints)}")
+            reference_keypoints, reference_descriptors = detect_features(reference, sift)
         else:
-            good_matches = match_features(
-                reference_descriptors, descriptors, matcher
-            )
-            corners, inliers = find_object(
-                reference_keypoints, keypoints, good_matches, reference.shape
-            )
+            if args.method == "hybrid" and corners is not None:
+                corners, points, _ = track_points(previous_gray, gray, points, corners)
+            if args.method == "sift" or corners is None:
+                keypoints, descriptors = detect_features(frame, sift)
+                good_matches = match_features(reference_descriptors, descriptors, matcher)
+                corners, points, _ = find_object(
+                    reference_keypoints, keypoints, good_matches, reference.shape
+                )
 
         if corners is not None:
-            cv2.polylines(frame, [corners], True, (0, 255, 0), 2)
-            x, y = corners[0, 0]
-            cv2.putText(frame, "Mona Lisa", (int(x), max(20, int(y) - 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
+            draw_object(frame, corners)
         writer.write(frame)
+        previous_gray = gray
         processed += 1
-
         if processed in example_frames:
-            visualization = cv2.drawMatches(
-                reference, reference_keypoints, frame, keypoints, good_matches, None,
-                flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS,
-            )
-            image_path = output / f"{args.input.stem}_matches_{processed:04d}.jpg"
-            cv2.imwrite(str(image_path), visualization)
-            cv2.imwrite(str(output / f"{args.input.stem}_frame_{processed:04d}.jpg"), frame)
-            print(
-                f"Frame {processed}: {len(keypoints)} keypoints, "
-                f"{len(good_matches)} good matches, {inliers} inliers, "
-                f"detected={corners is not None}; saved {image_path}"
-            )
+            cv2.imwrite(str(output / f"{output_stem}_frame_{processed:04d}.jpg"), frame)
 
     capture.release()
     writer.release()
