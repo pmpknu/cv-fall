@@ -1,0 +1,5 @@
+*.avi
+*.jpg
+!report/*.jpg
+*.mp4
+.DS_Store
