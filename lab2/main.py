@@ -2,6 +2,7 @@ import argparse
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 
 def detect_features(image, orb):
@@ -29,9 +30,32 @@ def match_features(descriptors1, descriptors2, matcher):
     return good_matches
 
 
+def find_object(reference_keypoints, keypoints, matches, reference_shape):
+    if len(matches) < 4:
+        return None, 0
+
+    src = np.float32([reference_keypoints[m.queryIdx].pt for m in matches])
+    dst = np.float32([keypoints[m.trainIdx].pt for m in matches])
+    matrix, mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
+
+    inliers = int(mask.sum()) if mask is not None else 0
+    if matrix is None or inliers < 8:
+        return None, inliers
+
+    height, width = reference_shape[:2]
+    corners = np.float32([
+        [0, 0],
+        [width - 1, 0],
+        [width - 1, height - 1],
+        [0, height - 1],
+    ]).reshape(-1, 1, 2)
+    transformed = cv2.perspectiveTransform(corners, matrix)
+    return np.int32(transformed), inliers
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Detect ORB keypoints and match video frames to the first frame."
+        description="Track a planar object using ORB and RANSAC."
     )
     parser.add_argument("input", type=Path, help="path to the input video")
     args = parser.parse_args()
@@ -64,8 +88,10 @@ def main():
         success, frame = capture.read()
         if not success:
             break
+
         keypoints, descriptors = detect_features(frame, orb)
         good_matches = []
+        corners, inliers = None, 0
 
         if processed == 0:
             reference = frame.copy()
@@ -76,9 +102,17 @@ def main():
             good_matches = match_features(
                 reference_descriptors, descriptors, matcher
             )
+            corners, inliers = find_object(
+                reference_keypoints, keypoints, good_matches, reference.shape
+            )
 
-        marked_frame = cv2.drawKeypoints(frame, keypoints, None, color=(0, 255, 0))
-        writer.write(marked_frame)
+        if corners is not None:
+            cv2.polylines(frame, [corners], True, (0, 255, 0), 2)
+            x, y = corners[0, 0]
+            cv2.putText(frame, "Mona Lisa", (int(x), max(20, int(y) - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        writer.write(frame)
         processed += 1
 
         if processed in example_frames:
@@ -88,9 +122,11 @@ def main():
             )
             image_path = output / f"{args.input.stem}_matches_{processed:04d}.jpg"
             cv2.imwrite(str(image_path), visualization)
+            cv2.imwrite(str(output / f"{args.input.stem}_frame_{processed:04d}.jpg"), frame)
             print(
                 f"Frame {processed}: {len(keypoints)} keypoints, "
-                f"{len(good_matches)} good matches; saved {image_path}"
+                f"{len(good_matches)} good matches, {inliers} inliers, "
+                f"detected={corners is not None}; saved {image_path}"
             )
 
     capture.release()
