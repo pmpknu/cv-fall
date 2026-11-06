@@ -100,6 +100,21 @@ def track_points(previous_gray, gray, points, corners):
     return transformed, dst[mask.ravel() == 1], inliers
 
 
+def credible_correction(flow, sift, inliers, match_count):
+    if inliers < 12 or inliers < 0.5 * match_count:
+        return False
+    # Strong reference evidence can correct accumulated flow drift.
+    if inliers >= 20:
+        return True
+
+    # With fewer inliers, also require agreement with the current flow estimate.
+    intersection, _ = cv2.intersectConvexConvex(flow, sift)
+    union = cv2.contourArea(flow) + cv2.contourArea(sift) - intersection
+    diagonal = np.linalg.norm(np.ptp(flow.reshape(4, 2), axis=0))
+    largest_error = np.linalg.norm(flow - sift, axis=2).max()
+    return intersection >= 0.6 * union and largest_error <= 0.2 * diagonal
+
+
 def draw_object(frame, corners):
     corners = np.int32(corners)
     cv2.polylines(frame, [corners], True, (0, 255, 0), 2)
@@ -110,10 +125,11 @@ def draw_object(frame, corners):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Locate Mona Lisa using SIFT or SIFT with Lucas-Kanade tracking."
+        description="Locate Mona Lisa using SIFT or Lucas-Kanade tracking with SIFT drift correction."
     )
     parser.add_argument("input", type=Path, help="path to the input video")
-    parser.add_argument("--method", choices=("sift", "hybrid"), default="sift")
+    parser.add_argument("--method", choices=("sift", "hybrid"), default="hybrid",
+                        help="tracking method (default: hybrid)")
     args = parser.parse_args()
 
     capture = cv2.VideoCapture(str(args.input))
@@ -149,14 +165,25 @@ def main():
             reference = frame.copy()
             reference_keypoints, reference_descriptors = detect_features(reference, sift)
         else:
-            if args.method == "hybrid" and corners is not None:
-                corners, points, _ = track_points(previous_gray, gray, points, corners)
-            if args.method == "sift" or corners is None:
-                keypoints, descriptors = detect_features(frame, sift)
-                good_matches = match_features(reference_descriptors, descriptors, matcher)
-                corners, points, _ = find_object(
-                    reference_keypoints, keypoints, good_matches, reference.shape
-                )
+            keypoints, descriptors = detect_features(frame, sift)
+            good_matches = match_features(reference_descriptors, descriptors, matcher)
+            sift_corners, sift_points, inliers = find_object(
+                reference_keypoints, keypoints, good_matches, reference.shape
+            )
+            if args.method == "sift":
+                corners, points = sift_corners, sift_points
+            else:
+                if corners is not None:
+                    corners, points, _ = track_points(previous_gray, gray, points, corners)
+                if corners is None:
+                    corners, points = sift_corners, sift_points
+                elif sift_corners is not None and credible_correction(
+                    corners, sift_corners, inliers, len(good_matches)
+                ):
+                    corrected = 0.8 * corners + 0.2 * sift_corners
+                    if valid_corners(corrected, frame.shape):
+                        # Keep the measured flow points; correct only the quadrilateral.
+                        corners = corrected
 
         if corners is not None:
             draw_object(frame, corners)
