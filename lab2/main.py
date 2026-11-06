@@ -5,9 +5,9 @@ import cv2
 import numpy as np
 
 
-def detect_features(image, orb):
+def detect_features(image, sift):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    return orb.detectAndCompute(gray, None)
+    return sift.detectAndCompute(gray, None)
 
 
 def match_features(descriptors1, descriptors2, matcher):
@@ -55,7 +55,7 @@ def find_object(reference_keypoints, keypoints, matches, reference_shape):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Track a planar object using ORB and RANSAC."
+        description="Track a planar object using sift and RANSAC."
     )
     parser.add_argument("input", type=Path, help="path to the input video")
     args = parser.parse_args()
@@ -78,8 +78,8 @@ def main():
         str(output_path), cv2.VideoWriter_fourcc(*"MJPG"), fps, (width, height)
     )
 
-    orb = cv2.ORB_create(nfeatures=1000)
-    matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+    sift = cv2.SIFT_create(nfeatures=1000)
+    matcher = cv2.BFMatcher(cv2.NORM_L2)
     frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
     example_frames = {max(2, frame_count * part // 4) for part in (1, 2, 3)}
 
@@ -89,7 +89,7 @@ def main():
         if not success:
             break
 
-        keypoints, descriptors = detect_features(frame, orb)
+        keypoints, descriptors = detect_features(frame, sift)
         good_matches = []
         corners, inliers = None, 0
 
