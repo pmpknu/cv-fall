@@ -7,4 +7,8 @@ dependencies = [
     "diffusers==0.35.2",
     "pillow>=11,<13",
     "torch>=2.6,<3",
+    "torchmetrics",
+    "torchvision",
+    "piq",
+    "transformers",
 ]
