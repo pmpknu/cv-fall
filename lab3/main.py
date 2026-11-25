@@ -6,6 +6,7 @@ os.environ.setdefault(
 )
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
 
+import numpy as np
 import torch
 from diffusers.models.attention_processor import Attention
 from diffusers.pipelines.latent_diffusion.pipeline_latent_diffusion_superresolution import (
@@ -34,24 +35,32 @@ def load_model():
 
 
 @torch.inference_mode()
-def super_resolution(pipeline, image):
+def super_resolution(pipeline, image, mask):
     # prepare
     condition = preprocess(image)
     height, width = condition.shape[-2:]
     dtype = next(pipeline.unet.parameters()).dtype
+    condition = condition.to(device=pipeline.device, dtype=dtype)
+    reference = image.resize((width * 4, height * 4), Image.Resampling.BICUBIC)
+    reference_latents = pipeline.vqvae.encode(
+        preprocess(reference).to(condition)
+    ).latents
+    latent_mask = torch.as_tensor(mask, device=pipeline.device, dtype=torch.bool)[
+        None, None
+    ]
 
     # initial noise
     generator = torch.Generator("cpu").manual_seed(42)
     latent_shape = (1, pipeline.unet.config.in_channels // 2, height, width)
-    latents = randn_tensor(
+    noise = randn_tensor(
         latent_shape, generator=generator, device=pipeline.device, dtype=dtype
     )
-    condition = condition.to(device=pipeline.device, dtype=dtype)
     pipeline.scheduler.set_timesteps(20, device=pipeline.device)
-    latents = latents * pipeline.scheduler.init_noise_sigma
+    timesteps = pipeline.scheduler.timesteps
+    latents = noise * pipeline.scheduler.init_noise_sigma
 
     # diffusion
-    for timestep in pipeline.scheduler.timesteps:
+    for index, timestep in enumerate(timesteps):
         model_input = torch.cat([latents, condition], dim=1)
         # predict noise
         model_input = pipeline.scheduler.scale_model_input(model_input, timestep)
@@ -60,12 +69,25 @@ def super_resolution(pipeline, image):
         latents = pipeline.scheduler.step(
             predicted_noise, timestep, latents, eta=0
         ).prev_sample
+        # apply mask (noise for reference)
+        reference_next = reference_latents
+        if index + 1 < len(timesteps):
+            reference_next = pipeline.scheduler.add_noise(
+                reference_latents, noise, timesteps[index + 1].reshape(1)
+            )
+        # join latents
+        latents = torch.where(latent_mask, latents, reference_next)
 
     # latents to image
     decoded = pipeline.vqvae.decode(latents).sample
     decoded = decoded.clamp(-1, 1) / 2 + 0.5
     decoded = decoded.cpu().permute(0, 2, 3, 1).numpy()
-    return pipeline.numpy_to_pil(decoded)[0]
+    output = pipeline.numpy_to_pil(decoded)[0]
+    pixel_mask = Image.fromarray(mask.astype(np.uint8) * 255).resize(
+        reference.size, Image.Resampling.NEAREST
+    )
+    # preserve unmasked pixels
+    return Image.composite(output, reference, pixel_mask)
 
 
 def main():
@@ -79,18 +101,17 @@ def main():
     low_resolution.save("results/input.png")
     bicubic.save("results/bicubic.png")
 
-    pipeline = load_model()
-    with torch.inference_mode():
-        output = pipeline(
-            image=low_resolution,
-            num_inference_steps=20,
-            generator=torch.Generator("cpu").manual_seed(42),
-        ).images[0]
-    output.save("results/sr.png")
+    masks = {
+        "zero": np.zeros((64, 64), dtype=np.uint8),
+        "one": np.ones((64, 64), dtype=np.uint8),
+        "mixed": np.zeros((64, 64), dtype=np.uint8),
+    }
+    masks["mixed"][16:48, 16:48] = 1
 
-    custom_output = super_resolution(pipeline, low_resolution)
-    custom_output.save("results/custom_sr.png")
-    print("Results identical:", output.tobytes() == custom_output.tobytes())
+    pipeline = load_model()
+    for name, mask in masks.items():
+        output = super_resolution(pipeline, low_resolution, mask)
+        output.save(f"results/output_{name}.png")
 
 
 if __name__ == "__main__":
