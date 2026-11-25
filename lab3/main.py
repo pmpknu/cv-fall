@@ -91,7 +91,7 @@ def super_resolution(pipeline, image, mask):
 
 
 def main():
-    with Image.open("assets/test.jpg") as image:
+    with Image.open("assets/orange.jpg") as image:
         ground_truth = image.convert("RGB").resize((256, 256), Image.Resampling.BICUBIC)
     low_resolution = ground_truth.resize((64, 64), Image.Resampling.BICUBIC)
     bicubic = low_resolution.resize((256, 256), Image.Resampling.BICUBIC)
