@@ -1,0 +1,10 @@
+[project]
+name = "cv-lab3"
+version = "0.1.0"
+description = "lab3: local diffusion super-resolution inference"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "diffusers==0.35.2",
+    "pillow>=11,<13",
+    "torch>=2.6,<3",
+]
